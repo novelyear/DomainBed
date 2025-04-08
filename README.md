@@ -85,11 +85,19 @@ python3 -m domainbed.scripts.download \
 Train a model:
 
 ```sh
+# one GPU
 python3 -m domainbed.scripts.train\
        --data_dir=./domainbed/data/MNIST/\
        --algorithm IGA\
        --dataset ColoredMNIST\
        --test_env 2
+# multi-GPU
+torchrun --nproc_per_node=NUM_OF_YOUR_GPU \
+ -m domainbed.scripts.train\
+ --dataset 'VLCS' \
+ --algorithm ERM \
+ --data_dir "/VLCS" \
+ --test_envs 1
 ```
 
 Launch a sweep:

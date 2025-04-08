@@ -210,30 +210,38 @@ def split_meta_train_test(minibatches, num_meta_test=1):
     return pairs
 
 def accuracy(network, loader, weights, device):
-    correct = 0
-    total = 0
+    correct = torch.tensor(0.0, device=device)
+    total = torch.tensor(0.0, device=device)
     weights_offset = 0
 
     network.eval()
     with torch.no_grad():
         for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            p = network.predict(x)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            if isinstance(network, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+                p = network(x)
+            else:
+                p = network.predict(x)
+
             if weights is None:
-                batch_weights = torch.ones(len(x))
+                batch_weights = torch.ones(len(x), device=device)
             else:
-                batch_weights = weights[weights_offset : weights_offset + len(x)]
+                batch_weights = weights[weights_offset: weights_offset + len(x)].to(device)
                 weights_offset += len(x)
-            batch_weights = batch_weights.to(device)
+            # batch_weights = batch_weights.to(device)
             if p.size(1) == 1:
-                correct += (p.gt(0).eq(y).float() * batch_weights.view(-1, 1)).sum().item()
+                correct += (p.gt(0).eq(y).float() * batch_weights.view(-1, 1)).sum()
             else:
-                correct += (p.argmax(1).eq(y).float() * batch_weights).sum().item()
-            total += batch_weights.sum().item()
+                correct += (p.argmax(1).eq(y).float() * batch_weights).sum()
+            total += batch_weights.sum()
+    if isinstance(network, torch.nn.parallel.DistributedDataParallel):
+        torch.distributed.all_reduce(correct, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+    torch.cuda.synchronize()
     network.train()
 
-    return correct / total
+    return (correct / total).item()
 
 class Tee:
     def __init__(self, fname, mode="a"):

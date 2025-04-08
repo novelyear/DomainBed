@@ -7,19 +7,56 @@ import os
 import random
 import sys
 import time
-import uuid
 
 import numpy as np
 import PIL
 import torch
 import torchvision
 import torch.utils.data
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
 
 from domainbed import datasets
 from domainbed import hparams_registry
 from domainbed import algorithms
 from domainbed.lib import misc
 from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
+
+def init_distributed():
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"])) # set GPU
+def cleanup():
+    dist.destroy_process_group()
+def create_eval_loaders(in_splits, out_splits, uda_splits, hparams, device, num_gpus):
+    eval_loaders = []
+    eval_weights = []
+    eval_loader_names = []
+
+    is_ddp = num_gpus > 1
+
+    all_splits = in_splits + out_splits + uda_splits
+
+    for env_idx, (env, weights) in enumerate(all_splits):
+        loader = FastDataLoader(
+            dataset=env,
+            batch_size=64,
+            num_workers=dataset.N_WORKERS,
+            device=device,
+            is_ddp=is_ddp
+        )
+
+        eval_loaders.append(loader)
+        eval_weights.append(weights)
+
+        if env_idx < len(in_splits):
+            eval_loader_names.append(f'env{env_idx}_in')
+        elif env_idx < len(in_splits) + len(out_splits):
+            eval_loader_names.append(f'env{env_idx - len(in_splits)}_out')
+        else:
+            eval_loader_names.append(f'env{env_idx - len(in_splits) - len(out_splits)}_uda')
+
+    return eval_loaders, eval_weights, eval_loader_names
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
@@ -92,8 +129,11 @@ if __name__ == "__main__":
 
     if torch.cuda.is_available():
         device = "cuda"
+        num_gpus = torch.cuda.device_count()
+        print(f"Number of GPUs available: {num_gpus}")
     else:
         device = "cpu"
+        num_gpus = 0
 
     if args.dataset in vars(datasets):
         dataset = vars(datasets)[args.dataset](args.data_dir,
@@ -143,13 +183,31 @@ if __name__ == "__main__":
     if args.task == "domain_adaptation" and len(uda_splits) == 0:
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
 
-    train_loaders = [InfiniteDataLoader(
-        dataset=env,
-        weights=env_weights,
-        batch_size=hparams['batch_size'],
-        num_workers=dataset.N_WORKERS)
-        for i, (env, env_weights) in enumerate(in_splits)
-        if i not in args.test_envs]
+    if num_gpus > 1:
+        init_distributed()
+        hparams['batch_size'] *= num_gpus
+
+
+    filtered_in_splits = [(i, env, env_weights) for i, (env, env_weights) in enumerate(in_splits)
+                          if i not in args.test_envs]
+    if num_gpus > 1:
+        train_samplers = [
+            DistributedSampler(env, num_replicas=num_gpus, rank=int(os.environ["LOCAL_RANK"]), shuffle=True)
+            for i, env, env_weights in filtered_in_splits
+        ]
+    else:
+        train_samplers = [None for _ in filtered_in_splits]
+
+    train_loaders = [
+        InfiniteDataLoader(
+            dataset=env,
+            weights=env_weights,
+            batch_size=hparams['batch_size'],
+            num_workers=dataset.N_WORKERS,
+            sampler=train_samplers[j]
+        )
+        for j, (i, env, env_weights) in enumerate(filtered_in_splits)
+    ]
 
     uda_loaders = [InfiniteDataLoader(
         dataset=env,
@@ -158,18 +216,15 @@ if __name__ == "__main__":
         num_workers=dataset.N_WORKERS)
         for i, (env, env_weights) in enumerate(uda_splits)]
 
-    eval_loaders = [FastDataLoader(
-        dataset=env,
-        batch_size=64,
-        num_workers=dataset.N_WORKERS)
-        for env, _ in (in_splits + out_splits + uda_splits)]
-    eval_weights = [None for _, weights in (in_splits + out_splits + uda_splits)]
-    eval_loader_names = ['env{}_in'.format(i)
-        for i in range(len(in_splits))]
-    eval_loader_names += ['env{}_out'.format(i)
-        for i in range(len(out_splits))]
-    eval_loader_names += ['env{}_uda'.format(i)
-        for i in range(len(uda_splits))]
+    hparams['num_workers'] = dataset.N_WORKERS
+    eval_loaders, eval_weights, eval_loader_names = create_eval_loaders(
+        in_splits,
+        out_splits,
+        uda_splits,
+        hparams,
+        device,
+        num_gpus
+    )
 
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
     algorithm = algorithm_class(dataset.input_shape, dataset.num_classes, len(dataset) - len(args.test_envs), hparams)
@@ -178,6 +233,12 @@ if __name__ == "__main__":
         algorithm.load_state_dict(algorithm_dict)
 
     algorithm.to(device)
+    if num_gpus > 1:
+        device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+        # init_distributed()
+        algorithm.to(device)
+        algorithm = DDP(algorithm, device_ids=[int(os.environ["LOCAL_RANK"])],
+                        output_device=int(os.environ["LOCAL_RANK"]))
 
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
@@ -205,6 +266,11 @@ if __name__ == "__main__":
     last_results_keys = None
     for step in range(start_step, n_steps):
         step_start_time = time.time()
+
+        if num_gpus > 1:
+            for sampler in train_samplers:
+                sampler.set_epoch(step)
+
         minibatches_device = [(x.to(device), y.to(device))
             for x,y in next(train_minibatches_iterator)]
         if args.task == "domain_adaptation":
@@ -212,7 +278,12 @@ if __name__ == "__main__":
                 for x,_ in next(uda_minibatches_iterator)]
         else:
             uda_device = None
-        step_vals = algorithm.update(minibatches_device, uda_device)
+
+        if isinstance(algorithm, DDP):
+            step_vals = algorithm.module.update(minibatches_device, uda_device)
+        else:
+            step_vals = algorithm.update(minibatches_device, uda_device)
+
         checkpoint_vals['step_time'].append(time.time() - step_start_time)
 
         for key, val in step_vals.items():
@@ -261,3 +332,6 @@ if __name__ == "__main__":
 
     with open(os.path.join(args.output_dir, 'done'), 'w') as f:
         f.write('done')
+
+    if num_gpus > 1:
+        cleanup()
